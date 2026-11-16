@@ -17,6 +17,24 @@
 //   for the same request would fail the trial's one-provider check, so failover only ever follows
 //   a refusal.
 //
+// PROVIDER HEALTH (failure classification — the router learns from refusals, it does not just
+//   count them)
+//   Not every refusal means the same thing, so the router classifies each one and remembers it
+//   for the rest of the trial (all of it a deterministic function of the requests and the
+//   provider answers seen so far, so a replay makes the same calls in the same order):
+//   - 402 means the provider's per-trial budget is spent: it will refuse every later call too,
+//     so it is marked dead and never tried again — trying it again would only burn the request's
+//     failover chain and the trial's call count for nothing.
+//   - 429 / 5xx / unreachable is transient: the provider keeps one consecutive-failure strike,
+//     and after two strikes in a row it is cooled down for the next two requests (the provider
+//     that went dark mid-trial, or one on its failure schedule, is not hammered while it is down).
+//     A 200 clears its strikes. While cooled down a provider is skipped, never retried.
+//   - A provider with strikes is demoted in the ordering by 100 rating-milli per strike (the
+//     table's ratings run ~1100-1500 milli, so one strike costs a provider its edge over a close
+//     rival but does not bury a clearly better model): the router prefers a clean provider of
+//     nearly equal quality over a flaky one, and only spends the flaky provider's quota when it
+//     is genuinely the best remaining pick.
+//
 // WIRES
 //   The client speaks OpenAI Chat Completions or Anthropic Messages; a provider speaks openai,
 //   anthropic or gemini. The request is translated into the provider's wire (lib/upstream.ts)
@@ -117,6 +135,19 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Inference calls made to each provider so far, answered and refused alike. */
 const callsMade = new Map<string, number>();
+/**
+ * Provider health, learned from refusals (see the header): a 402 marks a provider dead for the
+ * rest of the trial, its budget spent; transient refusals accumulate consecutive-failure strikes,
+ * and two strikes cool the provider down until `cooldownUntil`'s request index. A 200 clears a
+ * provider's strikes. All of it is a function of the requests and answers seen so far.
+ */
+const deadProviders = new Set<string>();
+const consecutiveFailures = new Map<string, number>();
+const cooldownUntil = new Map<string, number>();
+/** Rating-milli demotion per consecutive-failure strike when ordering candidates. */
+const FAILURE_PENALTY_MILLI = 100;
+/** Requests a provider stays cooled down after its second consecutive failure. */
+const COOLDOWN_REQUESTS = 2;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -192,12 +223,48 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
 
 /**
  * The candidates in the order this request tries them: providers still under quota first, in
- * rating order. When every candidate is over quota the rating order stands on its own: trying
- * the best model beats refusing the request.
+ * rating order. Health first: a dead provider (402 — budget spent) is never tried again, and a
+ * provider still inside its cooldown after two consecutive failures is skipped until the
+ * cooldown's request index passes. When every candidate is over quota, dead, or cooling down,
+ * the rating order stands on its own: trying the best model beats refusing the request.
+ * Within the live set, a provider is demoted 100 rating-milli per consecutive-failure strike,
+ * so a clean provider of nearly equal quality is tried before a flaky one.
  */
 function orderedCandidates(candidates: Candidate[]): Candidate[] {
-  const under = candidates.filter((c) => (callsMade.get(c.probe.provider.id) ?? 0) < quotaOf(c.probe.provider.id));
-  return under.length > 0 ? under : candidates;
+  const now = manifestIndex;
+  const live = candidates.filter((c) => {
+    const id = c.probe.provider.id;
+    if (deadProviders.has(id)) return false;
+    if ((cooldownUntil.get(id) ?? -1) > now) return false;
+    return true;
+  });
+  const pool = live.length > 0 ? live : candidates;
+  const effective = (c: Candidate): number => c.rating - FAILURE_PENALTY_MILLI * (consecutiveFailures.get(c.probe.provider.id) ?? 0);
+  const under = pool.filter((c) => (callsMade.get(c.probe.provider.id) ?? 0) < quotaOf(c.probe.provider.id));
+  const picked = under.length > 0 ? under : pool;
+  return [...picked].sort(
+    (a, b) => effective(b) - effective(a) || (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0),
+  );
+}
+
+/** Record what one provider's answer means for its health (see the header's classification). */
+function recordOutcome(providerId: string, outcome: 'ok' | 'exhausted' | 'transient'): void {
+  if (outcome === 'ok') {
+    consecutiveFailures.set(providerId, 0);
+    return;
+  }
+  if (outcome === 'exhausted') {
+    deadProviders.add(providerId);
+    consecutiveFailures.set(providerId, 0);
+    log(`${providerId} answered 402: its budget is spent, it will not be tried again this trial`);
+    return;
+  }
+  const strikes = (consecutiveFailures.get(providerId) ?? 0) + 1;
+  consecutiveFailures.set(providerId, strikes);
+  if (strikes >= 2) {
+    cooldownUntil.set(providerId, manifestIndex + COOLDOWN_REQUESTS);
+    log(`${providerId} failed ${strikes} times in a row: cooling down for the next ${COOLDOWN_REQUESTS} requests`);
+  }
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -420,12 +487,17 @@ async function serve(clientApi: ClientApi, body: Json, res: ServerResponse): Pro
     try {
       upstream = await callCandidate(candidate, clientApi, body);
     } catch (err) {
+      // Unreachable / timed out: transient, and the provider earns a strike.
+      recordOutcome(candidate.probe.provider.id, 'transient');
       lastDetail = `${candidate.probe.provider.id}/${candidate.model.id} could not be reached: ${(err as Error).message}`;
       log(lastDetail);
       continue;
     }
     if (!upstream.ok) {
       // A refusal spends one of the provider's calls and never answers the request: fail over.
+      // 402 means the budget is spent (the provider is dead for this trial); anything else is
+      // a transient refusal and earns the provider a strike.
+      recordOutcome(candidate.probe.provider.id, upstream.status === 402 ? 'exhausted' : 'transient');
       let detail = '';
       try {
         detail = (await upstream.text()).slice(0, 200);
@@ -436,6 +508,7 @@ async function serve(clientApi: ClientApi, body: Json, res: ServerResponse): Pro
       log(lastDetail);
       continue;
     }
+    recordOutcome(candidate.probe.provider.id, 'ok');
     await answerFrom(candidate, clientApi, upstream, res);
     return true;
   }
